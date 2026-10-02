@@ -633,7 +633,23 @@ void MultiplayerSchemaUnits::spawnLaterUnits(int gameTime)
 	{
 		popMissionUnit();
 		MissionUnitsStruct* missionUnit = &taPtr->GameingState_Ptr->uniqueIdentifiers[iMissionUnit];
-		if (missionUnit->Unitname[0] != '\0')
+		if (_stricmp(missionUnit->Unitname, "GGMSG") == 0)
+		{
+			// GG mission message: a schema entry with no real unit, its text in Ident and its time
+			// in CreationCountdown. Shown once, locally, to whoever owns its Player (the AI's host,
+			// i.e. the player), from the game tick, never from inside the battleroom proc. Stock
+			// TDraw finds no unit called GGMSG and skips the entry, so such maps stay playable.
+			int idxPosition = missionUnit->Player - 1;
+			int idxPlayer = unsigned(idxPosition) < 10 ? m_playersByStartPosition[idxPosition] : -1;
+			PlayerStruct* owner = idxPosition == 10 ? m_neutralPlayer
+				: unsigned(idxPlayer) < 10 ? &taPtr->Players[idxPlayer] : NULL;
+			if (owner && InferredPlayerTypeIsLocal(owner) && missionUnit->Ident && missionUnit->Ident[0] != '\0')
+			{
+				IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::spawnLaterUnits] message at %ds: %s", gameTimeSecs, missionUnit->Ident);
+				SendText(missionUnit->Ident, 0);
+			}
+		}
+		else if (missionUnit->Unitname[0] != '\0')
 		{
 			int idxPosition = missionUnit->Player - 1;
 			int idxPlayer = unsigned(idxPosition) < 10 ? m_playersByStartPosition[idxPosition] : -1;
