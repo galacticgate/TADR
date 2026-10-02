@@ -444,6 +444,20 @@ void MultiplayerSchemaUnits::onFrame()
 		return;
 	}
 	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
+	{
+		// While the mission lock is new: every 5 s, why the AI is or isn't being added.
+		static DWORD lastDiagnostic = 0;
+		DWORD tick = GetTickCount();
+		if (tick - lastDiagnostic >= 5000)
+		{
+			lastDiagnostic = tick;
+			PlayerInfoStruct* info = taPtr->Players[taPtr->LocalHumanPlayer_PlayerID].PlayerInfo;
+			int units = taPtr->GameingState_Ptr ? int(taPtr->GameingState_Ptr->uniqueIdentifierCount) : -1;
+			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::onFrame] schema units=%d neutral=%d aiSlot=%d host=%d battleroom=%d",
+				units, units > 0 ? int(mapHasNeutralSpawnUnits()) : 0, FindLocalAiSlot(),
+				info ? int(info->SharedBits & IsHost) : -1, int(IsBattleroomActive()));
+		}
+	}
 	if (!taPtr->GameingState_Ptr || !mapHasNeutralSpawnUnits() || FindLocalAiSlot() >= 0)
 	{
 		return;
