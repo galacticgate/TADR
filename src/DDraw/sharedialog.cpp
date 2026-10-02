@@ -7,6 +7,7 @@
 #include "hook/etc.h"
 #include "hook/hook.h"
 #include "sharedialog.h"
+#include "MultiplayerSchemaUnits.h"
 
 using namespace softwaredebugmode;
 
@@ -352,6 +353,9 @@ int __stdcall BattleroomDialogProc(PInlineX86StackBuffer X86StrackBuffer)
 			ShowText(&ta->Players[ta->LocalHumanPlayer_PlayerID], ".autopause", 0, 0);
 		}
 	}
+
+	// GG placement missions: keep the mission's AI in the battleroom (adds it, ignores removal clicks)
+	MultiplayerSchemaUnits::GetInstance()->onBattleroomHostProc(TAUI_p);
 	return 0;
 }
 

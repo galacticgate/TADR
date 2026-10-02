@@ -96,7 +96,7 @@ static bool BattleroomAddAi(const std::string controlPrefix, int numClicks)
 		// So we'll invoke it by faking a GUI button press ...
 
 		std::string targetControlName = controlPrefix + std::to_string(availableSlot);
-		_GUI0IDControl* playerGuiControl = taPtr->desktopGUI.TheActive_GUIMEM->ControlsAry;
+		_GUI0IDControl* playerGuiControl = taPtr->desktopGUI.TheActive_GUIMEM ? taPtr->desktopGUI.TheActive_GUIMEM->ControlsAry : NULL;
 		int idxPlayerGuiControl = -1;
 		if (playerGuiControl)
 		{
@@ -110,6 +110,11 @@ static bool BattleroomAddAi(const std::string controlPrefix, int numClicks)
 				}
 			}
 		}
+		if (idxPlayerGuiControl < 0)
+		{
+			// GG: not the battleroom (or no such slot control); clicking -1 would do nothing useful
+			return false;
+		}
 
 		for (int i = 0; i < numClicks; ++i)
 		{
@@ -121,6 +126,21 @@ static bool BattleroomAddAi(const std::string controlPrefix, int numClicks)
 	}
 
 	return availableSlot >= 0;
+}
+
+// GG: the battleroom slot holding a local AI, or -1
+static int FindLocalAiSlot()
+{
+	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
+	for (int i = 0; i < 10; ++i)
+	{
+		if (taPtr->Players[i].My_PlayerType == Player_LocalAI ||
+			(taPtr->Players[i].PlayerInfo && taPtr->Players[i].PlayerInfo->PlayerType == Player_LocalAI))
+		{
+			return i;
+		}
+	}
+	return -1;
 }
 
 static unsigned int InitMissionUnitSpawnQueueAddr = 0x49759f;
@@ -142,12 +162,16 @@ static unsigned int BattleroomStartButtonHookProc(PInlineX86StackBuffer X86Strac
 	{
 		return 0;
 	}
-	if (userNotified)
+
+	// GG: a mission never starts without its AI, so check on every Start, not just the first
+	bool missionLocked = MultiplayerSchemaUnits::GetInstance()->isMissionLocked();
+	if (userNotified && !missionLocked)
 	{
 		return 0;
 	}
 
 	bool aiAdded = false;
+	bool aiMissing = false;
 	if (MultiplayerSchemaUnits::GetInstance()->mapHasNeutralSpawnUnits())
 	{
 		TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
@@ -163,7 +187,26 @@ static unsigned int BattleroomStartButtonHookProc(PInlineX86StackBuffer X86Strac
 		if (!alreadyHasAi)
 		{
 			aiAdded = BattleroomAddAi("PLAYER", 2);
+			aiMissing = !aiAdded;
 		}
+	}
+
+	if (missionLocked)
+	{
+		if (aiAdded)
+		{
+			SendText("Mission: an AI has been added to play the enemy. Press Start again", 0);
+		}
+		else if (aiMissing)
+		{
+			SendText("Mission: the enemy AI needs a free slot. Open one, then press Start", 0);
+		}
+		if (aiAdded || aiMissing)
+		{
+			X86StrackBuffer->rtnAddr_Pvoid = (LPVOID)0x448a62;		// discard the START command
+			return X86STRACKBUFFERCHANGE;
+		}
+		return 0;
 	}
 
 	if (aiAdded)
@@ -267,6 +310,11 @@ static unsigned int MultiplayerSpawnPlayerCommanderHookProc(PInlineX86StackBuffe
 
 static void BattleroomCommand_SpawnOff(const std::vector<std::string>&)
 {
+	if (MultiplayerSchemaUnits::GetInstance()->isMissionLocked())
+	{
+		SendText("Mission: unit spawn stays on", 0);
+		return;
+	}
 	MultiplayerSchemaUnits::GetInstance()->setUserSpawnEnabled(false);
 	SendText("Unit spawn is disabled ...", 0);
 }
@@ -295,7 +343,9 @@ MultiplayerSchemaUnits* MultiplayerSchemaUnits::GetInstance()
 MultiplayerSchemaUnits::MultiplayerSchemaUnits():
 	m_spawnEnabled(true),
 	m_spawnQueueIterator(m_spawnQueue.end()),
-	m_neutralPlayer(NULL)
+	m_neutralPlayer(NULL),
+	m_missionLock(-1),
+	m_lastAiAddTicks(0)
 {
 	std::fill(m_startPositionsByPlayer, m_startPositionsByPlayer + 10, -1);
 	std::fill(m_playersByStartPosition, m_playersByStartPosition + 10, -1);
@@ -324,6 +374,76 @@ void MultiplayerSchemaUnits::setUserSpawnEnabled(bool enabled)
 	m_spawnEnabled = enabled;
 }
 
+bool MultiplayerSchemaUnits::isMissionLocked()
+{
+	if (m_missionLock < 0)
+	{
+		// gpgnet4ta rewrites TAForever.ini, next to the game executable, before every launch
+		char exePath[MAX_PATH] = { 0 };
+		DWORD n = GetModuleFileNameA(NULL, exePath, MAX_PATH);
+		std::string iniPath(exePath, n);
+		iniPath = iniPath.substr(0, iniPath.find_last_of("\\/") + 1) + "TAForever.ini";
+		m_missionLock = GetPrivateProfileIntA("totala", "ggmissionlock", 0, iniPath.c_str()) ? 1 : 0;
+		IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::isMissionLocked] %d from %s", m_missionLock, iniPath.c_str());
+	}
+	return m_missionLock > 0;
+}
+
+void MultiplayerSchemaUnits::onBattleroomHostProc(_GUIInfo* gui)
+{
+	// The battleroom proc runs again inside BattleroomAddAi's faked clicks; ignore those.
+	static bool busy = false;
+	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
+	if (busy || !gui || !taPtr->GameingState_Ptr || !isMissionLocked() || !mapHasNeutralSpawnUnits())
+	{
+		return;
+	}
+
+	int aiSlot = FindLocalAiSlot();
+	if (aiSlot >= 0)
+	{
+		// T4: a click on the AI's name cycles it out of its slot. Swallow it.
+		_GUI0IDControl* controls = gui->TheActive_GUIMEM ? gui->TheActive_GUIMEM->ControlsAry : NULL;
+		int clicked = gui->UIChange_f;
+		if (controls && clicked > 0 && clicked <= controls->totalgadgets &&
+			std::string("PLAYER") + std::to_string(aiSlot) == controls[clicked].name)
+		{
+			gui->UIChange_f = -1;
+			gui->GUIUpdated_b = 0;
+			SendText("Mission: the enemy AI can't be removed", 0);
+		}
+		return;
+	}
+
+	// T3: add the AI as soon as the host is in the battleroom, so the first Start isn't swallowed.
+	// The new AI may not show in Players[] at once; don't add a second one meanwhile.
+	DWORD now = GetTickCount();
+	if (m_lastAiAddTicks != 0 && now - m_lastAiAddTicks < 3000)
+	{
+		return;
+	}
+	m_lastAiAddTicks = now;
+
+	// The faked clicks go through the desktop GUI; put back whatever event this proc call is handling.
+	GUIInfo* desktop = &taPtr->desktopGUI;
+	int savedChange = gui->UIChange_f;
+	int savedUpdated = gui->GUIUpdated_b;
+	int savedDesktopChange = desktop->UIChange_f;
+	int savedDesktopUpdated = desktop->GUIUpdated_b;
+	busy = true;
+	bool added = BattleroomAddAi("PLAYER", 2);
+	busy = false;
+	desktop->UIChange_f = savedDesktopChange;
+	desktop->GUIUpdated_b = savedDesktopUpdated;
+	gui->UIChange_f = savedChange;
+	gui->GUIUpdated_b = savedUpdated;
+	IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::onBattleroomHostProc] mission AI added=%d", int(added));
+	if (added)
+	{
+		SendText("Mission: an AI has been added to play the enemy", 0);
+	}
+}
+
 bool MultiplayerSchemaUnits::mapHasSpawnUnits()
 {
 	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
@@ -348,6 +468,7 @@ void MultiplayerSchemaUnits::initMissionUnitSpawnQueue(void)
 	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
 
 	m_spawnQueue.clear();
+	m_spawnedUnits.assign(taPtr->GameingState_Ptr->uniqueIdentifierCount, NULL);
 	for (int iMissionUnit = 0; iMissionUnit < taPtr->GameingState_Ptr->uniqueIdentifierCount; ++iMissionUnit)
 	{
 		MissionUnitsStruct* missionUnit = &taPtr->GameingState_Ptr->uniqueIdentifiers[iMissionUnit];
@@ -449,6 +570,15 @@ bool MultiplayerSchemaUnits::spawnInitialUnits(PlayerStruct* targetPlayer, int t
 			}
 		}
 		newUnits[iMissionUnit] = newUnit;
+		if (newUnit)
+		{
+			// GG: remembered so a delayed unit's orders can name units spawned at the start
+			if (m_spawnedUnits.size() < newUnits.size())
+			{
+				m_spawnedUnits.resize(newUnits.size(), NULL);
+			}
+			m_spawnedUnits[iMissionUnit] = newUnit;
+		}
 	}
 
 	for (int iMissionUnit = 0; iMissionUnit < taPtr->GameingState_Ptr->uniqueIdentifierCount; ++iMissionUnit)
@@ -492,7 +622,18 @@ void MultiplayerSchemaUnits::spawnLaterUnits(int gameTime)
 
 			if (targetPlayer && InferredPlayerTypeIsLocal(targetPlayer) && !(targetPlayer->PlayerInfo->PropertyMask & WATCH))
 			{
-				DoSpawnUnit(targetPlayer, missionUnit, 0);
+				UnitStruct* newUnit = DoSpawnUnit(targetPlayer, missionUnit, 0);
+				// T1 (GG): in a mission, a delayed unit runs its InitialMission like one spawned at
+				// the start. Other games keep upstream's behaviour (delayed units get no orders).
+				if (newUnit && isMissionLocked())
+				{
+					if (m_spawnedUnits.size() < taPtr->GameingState_Ptr->uniqueIdentifierCount)
+					{
+						m_spawnedUnits.resize(taPtr->GameingState_Ptr->uniqueIdentifierCount, NULL);
+					}
+					m_spawnedUnits[iMissionUnit] = newUnit;
+					DoParseInitialMissionCommands(iMissionUnit, missionUnit, newUnit, m_spawnedUnits.data());
+				}
 			}
 		}
 

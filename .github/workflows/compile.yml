@@ -1,23 +1,23 @@
-name: Build and Release tdraw.dll
+name: Build tdraw.dll (GG)
 
+# GG fork: branches gg-* build the DLL as a workflow artifact (no release). Upstream's
+# master/tag release flow is left to upstream; a GG release is published by hand from an artifact.
 on:
   push:
     branches:
-      - master
-    tags:
-      - '*'
+      - 'gg-*'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
 
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up MSVC
       uses: ilammy/msvc-dev-cmd@v1
@@ -28,30 +28,12 @@ jobs:
       run: |
         msbuild src/DDraw/ddraw.vcxproj /p:Configuration=ReleasePublic /p:Platform=x86
 
-    - name: Create archive
-      run: |
-        Compress-Archive -Path src\DDraw\Public\tdraw.dll,src\DDraw\totala.ini,src\DDraw\tdraw.txt,LICENSE -Destination src\DDraw\Public\tdraw.zip
-
-    - name: Create pre-release
-      uses: "marvinpinto/action-automatic-releases@latest"
-      if: github.ref == 'refs/heads/master'
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
-        repo_token: "${{ secrets.GITHUB_TOKEN }}"
-        automatic_release_tag: "latest"
-        prerelease: true
-        title: "Development Build"
-        files: |
-          src/DDraw/Public/tdraw.zip
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Create release
-      uses: "marvinpinto/action-automatic-releases@latest"
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        repo_token: "${{ secrets.GITHUB_TOKEN }}"
-        prerelease: false
-        files: |
-          src/DDraw/Public/tdraw.zip
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: tdraw
+        path: |
+          src/DDraw/Public/tdraw.dll
+          src/DDraw/Public/tdraw.pdb
+        if-no-files-found: error
+        retention-days: 14
