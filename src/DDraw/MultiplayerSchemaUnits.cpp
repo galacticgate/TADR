@@ -147,7 +147,8 @@ static int FindLocalAiSlot()
 }
 
 // GG director: the finished units of these types that belong to players at war with `self`
-// (every human that is not watching), with each one's slot index to tell a reused slot later.
+// (every human that is not watching), each with its type (UnitID), to tell later that its slot has
+// gone to another unit (UnitInGameIndex is the slot's own number, so it can't).
 // The type "*" stands for any unit that doesn't fly: ground units and buildings.
 static std::vector<std::pair<UnitStruct*, short> > EnemyUnitsOfTypes(PlayerStruct* self, const std::vector<std::string>& types)
 {
@@ -178,7 +179,7 @@ static std::vector<std::pair<UnitStruct*, short> > EnemyUnitsOfTypes(PlayerStruc
 			{
 				if (type == "*" ? !(def.UnitTypeMask_0 & canfly) : _stricmp(def.UnitName, type.c_str()) == 0)
 				{
-					found.push_back(std::make_pair(unit, unit->UnitInGameIndex));
+					found.push_back(std::make_pair(unit, unit->UnitID));
 					break;
 				}
 			}
@@ -230,6 +231,29 @@ static void BroadcastChatLine(const char* text)
 	strncpy(buffer + 1, text, sizeof(buffer) - 2);
 	unsigned fromDpid = taPtr->Players[taPtr->LocalHumanPlayer_PlayerID].DirectPlayID;
 	HAPI_BroadcastMessage(fromDpid, buffer, sizeof(buffer));
+}
+
+// GG: a line for the whole team: shown here and sent on to every other TA instance.
+static void TellTeam(const char* text)
+{
+	SendText(text, 0);
+	BroadcastChatLine(text);
+}
+
+// GG: roughly where on the map a unit is, by thirds: "north-west" to "south-east", or "middle".
+static const char* MapZone(const UnitStruct* unit)
+{
+	static const char* const zones[3][3] = {
+		{ "north-west", "north", "north-east" },
+		{ "west", "middle", "east" },
+		{ "south-west", "south", "south-east" },
+	};
+	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
+	int width = taPtr->FeatureMapSizeX * 16;
+	int height = taPtr->FeatureMapSizeY * 16;
+	int column = width > 0 ? 3 * int(unit->XPos) / width : 1;
+	int row = height > 0 ? 3 * int(unit->ZPos) / height : 1;
+	return zones[row < 0 ? 0 : row > 2 ? 2 : row][column < 0 ? 0 : column > 2 ? 2 : column];
 }
 
 static unsigned int InitMissionUnitSpawnQueueAddr = 0x49759f;
@@ -437,7 +461,8 @@ MultiplayerSchemaUnits::MultiplayerSchemaUnits():
 	m_lastAiAddTicks(0),
 	m_ggMap(false),
 	m_anchorReleased(false),
-	m_lastDirectorTick(0)
+	m_lastDirectorTick(0),
+	m_lastStragglers(-1)
 {
 	std::fill(m_startPositionsByPlayer, m_startPositionsByPlayer + 10, -1);
 	std::fill(m_playersByStartPosition, m_playersByStartPosition + 10, -1);
@@ -592,14 +617,15 @@ void MultiplayerSchemaUnits::initMissionUnitSpawnQueue(void)
 	m_spawnQueue.clear();
 	unsigned count = taPtr->GameingState_Ptr->uniqueIdentifierCount;
 	m_spawnedUnits.assign(count, NULL);
-	m_spawnedIndex.assign(count, 0);
+	m_spawnedType.assign(count, 0);
 	m_orderedTarget.assign(count, NULL);
-	m_orderedTargetIndex.assign(count, 0);
+	m_orderedTargetType.assign(count, 0);
 	m_orderedAt.assign(count, 0);
 	m_pending.clear();
 	m_unlessWatch.clear();
 	m_anchorReleased = false;
 	m_lastDirectorTick = 0;
+	m_lastStragglers = -1;
 
 	// GG: the director's rules, from the text after '@' in each entry's Ident.
 	m_rules.assign(count, GGRule());
@@ -650,6 +676,7 @@ void MultiplayerSchemaUnits::initMissionUnitSpawnQueue(void)
 			else if (key == "escort") rule.escort = value;
 			else if (key == "from") rule.from = atoi(value.c_str());
 			else if (key == "anchor") rule.anchor = true;
+			else if (key == "tell") rule.tell = atoi(value.c_str());
 		}
 		IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] rule %s: %s", rule.name.c_str(), ident.c_str() + at + 1);
 	}
@@ -761,10 +788,10 @@ bool MultiplayerSchemaUnits::spawnInitialUnits(PlayerStruct* targetPlayer, int t
 			if (m_spawnedUnits.size() < newUnits.size())
 			{
 				m_spawnedUnits.resize(newUnits.size(), NULL);
-				m_spawnedIndex.resize(newUnits.size(), 0);
+				m_spawnedType.resize(newUnits.size(), 0);
 			}
 			m_spawnedUnits[iMissionUnit] = newUnit;
-			m_spawnedIndex[iMissionUnit] = newUnit->UnitInGameIndex;
+			m_spawnedType[iMissionUnit] = newUnit->UnitID;
 		}
 	}
 
@@ -873,10 +900,20 @@ void MultiplayerSchemaUnits::spawnLateEntry(int iMissionUnit, int gameTimeSecs)
 			if (m_spawnedUnits.size() < taPtr->GameingState_Ptr->uniqueIdentifierCount)
 			{
 				m_spawnedUnits.resize(taPtr->GameingState_Ptr->uniqueIdentifierCount, NULL);
-				m_spawnedIndex.resize(taPtr->GameingState_Ptr->uniqueIdentifierCount, 0);
+				m_spawnedType.resize(taPtr->GameingState_Ptr->uniqueIdentifierCount, 0);
+			}
+			// TA hands a dead unit's slot to the next unit it creates, so an earlier entry whose
+			// unit lived in this slot is dead, not alive again (the zombie test's anchor waited on
+			// eight such names for one Zeus, 2026-10-02).
+			for (unsigned j = 0; j < m_spawnedUnits.size(); ++j)
+			{
+				if (m_spawnedUnits[j] == newUnit)
+				{
+					m_spawnedUnits[j] = NULL;
+				}
 			}
 			m_spawnedUnits[iMissionUnit] = newUnit;
-			m_spawnedIndex[iMissionUnit] = newUnit->UnitInGameIndex;
+			m_spawnedType[iMissionUnit] = newUnit->UnitID;
 			DoParseInitialMissionCommands(iMissionUnit, missionUnit, newUnit, m_spawnedUnits.data());
 			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] spawned %s at %ds",
 				unsigned(iMissionUnit) < m_rules.size() ? m_rules[iMissionUnit].name.c_str() : "?", gameTimeSecs);
@@ -891,7 +928,7 @@ bool MultiplayerSchemaUnits::isAlive(int iMissionUnit)
 		return false;
 	}
 	UnitStruct* unit = m_spawnedUnits[iMissionUnit];
-	return unit->IsUnit && unit->UnitInGameIndex == m_spawnedIndex[iMissionUnit];
+	return unit->IsUnit && unit->UnitID == m_spawnedType[iMissionUnit];
 }
 
 int MultiplayerSchemaUnits::findRule(const std::string& name)
@@ -928,7 +965,7 @@ void MultiplayerSchemaUnits::runDirector(int gameTime)
 		{
 			for (const auto& watched : m_unlessWatch[i])
 			{
-				if (!watched.first->IsUnit || watched.first->UnitInGameIndex != watched.second)
+				if (!watched.first->IsUnit || watched.first->UnitID != watched.second)
 				{
 					open = true;
 				}
@@ -981,7 +1018,7 @@ void MultiplayerSchemaUnits::runDirector(int gameTime)
 			// turns up, so a wave doesn't switch targets twice a second as everything moves.
 			UnitStruct* current = m_orderedTarget[i];
 			if (rule.huntAny && target && current && current != target &&
-				current->IsUnit && current->UnitInGameIndex == m_orderedTargetIndex[i] &&
+				current->IsUnit && current->UnitID == m_orderedTargetType[i] &&
 				4.0 * SquaredDistance(target, unit) > SquaredDistance(current, unit))
 			{
 				target = current;
@@ -1009,7 +1046,7 @@ void MultiplayerSchemaUnits::runDirector(int gameTime)
 		{
 			SendOrder(unit, target->XPos, target->YPos, target->ZPos, target, order, -1, false);
 			m_orderedTarget[i] = target;
-			m_orderedTargetIndex[i] = target->UnitInGameIndex;
+			m_orderedTargetType[i] = target->UnitID;
 			m_orderedAt[i] = gameTime;
 			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] %s: %s %s at %ds", rule.name.c_str(),
 				order == ordertype::ATTACK ? "attack" : "guard", ta->UnitDef[target->UnitID].UnitName, gameTimeSecs);
@@ -1020,7 +1057,7 @@ void MultiplayerSchemaUnits::runDirector(int gameTime)
 	if (!m_anchorReleased && m_pending.empty() && m_spawnQueueIterator == m_spawnQueue.end())
 	{
 		int anchor = -1;
-		bool anyAlive = false;
+		std::vector<int> alive;
 		for (unsigned i = 0; i < m_rules.size(); ++i)
 		{
 			if (m_rules[i].anchor)
@@ -1029,15 +1066,41 @@ void MultiplayerSchemaUnits::runDirector(int gameTime)
 			}
 			else if (isAlive(int(i)))
 			{
-				anyAlive = true;
+				alive.push_back(int(i));
 			}
 		}
-		if (anchor >= 0 && !anyAlive && isAlive(anchor))
+		if (anchor >= 0 && alive.empty() && isAlive(anchor))
 		{
 			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] every mission unit is spent at %ds; the anchor self-destructs", gameTimeSecs);
 			m_anchorReleased = true;
+			if (m_rules[anchor].tell > 0)
+			{
+				TellTeam("Every enemy is dead. Well done!");
+			}
 			DoParseInitialMissionCommands(anchor, &ta->GameingState_Ptr->uniqueIdentifiers[anchor],
 				m_spawnedUnits[anchor], m_spawnedUnits.data(), "d");
+		}
+		else if (anchor >= 0 && !alive.empty() && int(alive.size()) <= m_rules[anchor].tell &&
+			int(alive.size()) != m_lastStragglers)
+		{
+			// tell=N: the last few can be slow units still crossing the map from a far edge, and
+			// the game waits for them, so say how many are left and roughly where.
+			m_lastStragglers = int(alive.size());
+			std::string text = std::to_string(alive.size()) + (alive.size() == 1 ? " enemy left: " : " enemies left: ");
+			for (size_t k = 0; k < alive.size(); ++k)
+			{
+				UnitStruct* unit = m_spawnedUnits[alive[k]];
+				const UnitDefStruct& def = ta->UnitDef[unit->UnitID];
+				std::string next = text + (k ? ", " : "") + std::string(def.Name, strnlen(def.Name, sizeof(def.Name))) +
+					" (" + MapZone(unit) + ")";
+				if (next.size() > 63)	// a chat line's length
+				{
+					break;
+				}
+				text = next;
+			}
+			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] at %ds: %s", gameTimeSecs, text.c_str());
+			TellTeam(text.c_str());
 		}
 	}
 }

@@ -25,6 +25,8 @@ struct _GUIInfo;
 //                                target until it dies or something twice as close turns up
 //   NAME@anchor                  keeps its owner in the game; self-destructs once every other
 //                                mission unit has spawned and died, so the game can end
+//   NAME@anchor|tell=5           also, once nothing is left to come, tells the team how many enemy
+//                                units are left, and where, whenever 5 or fewer remain
 // Stock TDraw ignores all of it: to TA the Ident is only a label.
 struct GGRule
 {
@@ -37,6 +39,7 @@ struct GGRule
 	std::string after;
 	std::string escort;
 	bool anchor = false;
+	int tell = 0;
 };
 
 // spawns units for the first AI player as defined in the OTA file's schema
@@ -88,13 +91,17 @@ private:
 	bool isAlive(int iMissionUnit);
 	int findRule(const std::string& name);
 	std::vector<GGRule> m_rules;					// by mission unit index
-	std::vector<short> m_spawnedIndex;				// UnitInGameIndex at spawn, to tell a reused slot
+	// A unit's type (UnitID) when it was spawned. TA reuses a dead unit's slot, and UnitInGameIndex
+	// is the slot's own number, so only a changed type shows a slot now holds another unit; a new
+	// mission unit of the same type clears the earlier entry when it's spawned (spawnLateEntry).
+	std::vector<short> m_spawnedType;
 	std::vector<int> m_pending;						// late entries waiting for their gate
-	std::map<int, std::vector<std::pair<UnitStruct*, short> > > m_unlessWatch;
+	std::map<int, std::vector<std::pair<UnitStruct*, short> > > m_unlessWatch;	// with each unit's type
 	std::vector<UnitStruct*> m_orderedTarget;		// the director's last target, by mission unit
-	std::vector<short> m_orderedTargetIndex;		// that target's UnitInGameIndex, to tell a reused slot
+	std::vector<short> m_orderedTargetType;			// that target's type, as m_spawnedType
 	std::vector<int> m_orderedAt;					// and when it gave that order (game ticks)
 	bool m_ggMap;									// the map has GGMSG entries or '@' rules
 	bool m_anchorReleased;
 	int m_lastDirectorTick;
+	int m_lastStragglers;							// the enemy count last told (tell=), or -1
 };
