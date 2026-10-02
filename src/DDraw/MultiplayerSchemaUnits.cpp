@@ -410,7 +410,7 @@ void MultiplayerSchemaUnits::onBattleroomHostProc(_GUIInfo* gui)
 		{
 			gui->UIChange_f = -1;
 			gui->GUIUpdated_b = 0;
-			SendText("Mission: the enemy AI can't be removed", 0);
+			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::onBattleroomHostProc] ignored a click on the mission AI's slot %d", aiSlot);
 		}
 		return;
 	}
@@ -437,11 +437,9 @@ void MultiplayerSchemaUnits::onBattleroomHostProc(_GUIInfo* gui)
 	desktop->GUIUpdated_b = savedDesktopUpdated;
 	gui->UIChange_f = savedChange;
 	gui->GUIUpdated_b = savedUpdated;
+	// No chat line here: SendText from inside the battleroom proc re-enters it with no GUI and TA
+	// crashes in IsPressCommand (0x49fd66, 2026-10-02). The ghost watcher reports the mission's state.
 	IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::onBattleroomHostProc] mission AI added=%d", int(added));
-	if (added)
-	{
-		SendText("Mission: an AI has been added to play the enemy", 0);
-	}
 }
 
 bool MultiplayerSchemaUnits::mapHasSpawnUnits()
