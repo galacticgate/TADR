@@ -59,11 +59,13 @@ static UnitStruct* DoSpawnUnit(PlayerStruct *targetPlayer, MissionUnitsStruct* m
 	return newUnit;
 }
 
-static void DoParseInitialMissionCommands(int iMissionUnit, MissionUnitsStruct* missionUnit, UnitStruct *spawnedUnit, UnitStruct *allSpawnedUnits[])
+static void DoParseInitialMissionCommands(int iMissionUnit, MissionUnitsStruct* missionUnit, UnitStruct *spawnedUnit, UnitStruct *allSpawnedUnits[],
+	const char* script = NULL)	// GG: a script to run instead of the entry's InitialMission
 {
 	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
 
-	if (missionUnit->InitialMission && missionUnit->InitialMission[0] != '\0')
+	const char* mission = script ? script : missionUnit->InitialMission;
+	if (mission && mission[0] != '\0')
 	{
 		struct
 		{
@@ -74,7 +76,7 @@ static void DoParseInitialMissionCommands(int iMissionUnit, MissionUnitsStruct* 
 		spawnedUnitsAry.iMissionUnit = iMissionUnit;
 		spawnedUnitsAry.spawnedUnitsAry = allSpawnedUnits;
 
-		Campaign_ParseUnitInitialMissionCommands(spawnedUnit, missionUnit->InitialMission, (void*)&spawnedUnitsAry);
+		Campaign_ParseUnitInitialMissionCommands(spawnedUnit, mission, (void*)&spawnedUnitsAry);
 	}
 }
 
@@ -142,6 +144,64 @@ static int FindLocalAiSlot()
 		}
 	}
 	return -1;
+}
+
+// GG director: the finished units of these types that belong to players at war with `self`
+// (every human that is not watching), with each one's slot index to tell a reused slot later.
+static std::vector<std::pair<UnitStruct*, short> > EnemyUnitsOfTypes(PlayerStruct* self, const std::vector<std::string>& types)
+{
+	std::vector<std::pair<UnitStruct*, short> > found;
+	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
+	if (types.empty())
+	{
+		return found;
+	}
+	for (int p = 0; p < 10; ++p)
+	{
+		PlayerStruct* player = &taPtr->Players[p];
+		if (player == self || !player->PlayerActive || !player->Units || !player->PlayerInfo ||
+			(player->My_PlayerType != Player_LocalHuman && player->My_PlayerType != Player_RemoteHuman) ||
+			(player->PlayerInfo->PropertyMask & WATCH))
+		{
+			continue;
+		}
+		for (int u = 0; u < taPtr->MaxUnitNumberPerPlayer; ++u)
+		{
+			UnitStruct* unit = &player->Units[u];
+			if (!unit->IsUnit || unit->Nanoframe != 0.0f || unsigned(unit->UnitID) >= taPtr->UNITINFOCount)
+			{
+				continue;
+			}
+			const char* name = taPtr->UnitDef[unit->UnitID].UnitName;
+			for (const std::string& type : types)
+			{
+				if (_stricmp(name, type.c_str()) == 0)
+				{
+					found.push_back(std::make_pair(unit, unit->UnitInGameIndex));
+					break;
+				}
+			}
+		}
+	}
+	return found;
+}
+
+static UnitStruct* NearestEnemyOfTypes(PlayerStruct* self, const std::vector<std::string>& types, UnitStruct* from)
+{
+	UnitStruct* best = NULL;
+	double bestDistance = 0.0;
+	for (const auto& found : EnemyUnitsOfTypes(self, types))
+	{
+		double dx = double(found.first->XPos) - double(from->XPos);
+		double dz = double(found.first->ZPos) - double(from->ZPos);
+		double distance = dx * dx + dz * dz;
+		if (!best || distance < bestDistance)
+		{
+			best = found.first;
+			bestDistance = distance;
+		}
+	}
+	return best;
 }
 
 static unsigned int InitMissionUnitSpawnQueueAddr = 0x49759f;
@@ -346,7 +406,10 @@ MultiplayerSchemaUnits::MultiplayerSchemaUnits():
 	m_spawnQueueIterator(m_spawnQueue.end()),
 	m_neutralPlayer(NULL),
 	m_missionLock(-1),
-	m_lastAiAddTicks(0)
+	m_lastAiAddTicks(0),
+	m_ggMap(false),
+	m_anchorReleased(false),
+	m_lastDirectorTick(0)
 {
 	std::fill(m_startPositionsByPlayer, m_startPositionsByPlayer + 10, -1);
 	std::fill(m_playersByStartPosition, m_playersByStartPosition + 10, -1);
@@ -499,7 +562,62 @@ void MultiplayerSchemaUnits::initMissionUnitSpawnQueue(void)
 	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
 
 	m_spawnQueue.clear();
-	m_spawnedUnits.assign(taPtr->GameingState_Ptr->uniqueIdentifierCount, NULL);
+	unsigned count = taPtr->GameingState_Ptr->uniqueIdentifierCount;
+	m_spawnedUnits.assign(count, NULL);
+	m_spawnedIndex.assign(count, 0);
+	m_orderedTarget.assign(count, NULL);
+	m_orderedAt.assign(count, 0);
+	m_pending.clear();
+	m_unlessWatch.clear();
+	m_anchorReleased = false;
+	m_lastDirectorTick = 0;
+
+	// GG: the director's rules, from the text after '@' in each entry's Ident.
+	m_rules.assign(count, GGRule());
+	m_ggMap = false;
+	for (unsigned i = 0; i < count; ++i)
+	{
+		MissionUnitsStruct* missionUnit = &taPtr->GameingState_Ptr->uniqueIdentifiers[i];
+		if (_stricmp(missionUnit->Unitname, "GGMSG") == 0)
+		{
+			m_ggMap = true;
+		}
+		std::string ident = missionUnit->Ident ? missionUnit->Ident : "";
+		size_t at = ident.find('@');
+		GGRule& rule = m_rules[i];
+		rule.name = ident.substr(0, at);
+		if (at == std::string::npos)
+		{
+			continue;
+		}
+		rule.any = m_ggMap = true;
+		auto split = [](const std::string& text, char by) {
+			std::vector<std::string> parts;
+			size_t start = 0;
+			while (start <= text.size())
+			{
+				size_t end = text.find(by, start);
+				if (end == std::string::npos) end = text.size();
+				if (end > start) parts.push_back(text.substr(start, end - start));
+				start = end + 1;
+			}
+			return parts;
+		};
+		for (const std::string& term : split(ident.substr(at + 1), '|'))
+		{
+			size_t eq = term.find('=');
+			std::string key = term.substr(0, eq);
+			std::string value = eq == std::string::npos ? "" : term.substr(eq + 1);
+			if (key == "unless") rule.unless = split(value, ',');
+			else if (key == "hunt") rule.hunt = split(value, ',');
+			else if (key == "after") rule.after = value;
+			else if (key == "escort") rule.escort = value;
+			else if (key == "from") rule.from = atoi(value.c_str());
+			else if (key == "anchor") rule.anchor = true;
+		}
+		IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] rule %s: %s", rule.name.c_str(), ident.c_str() + at + 1);
+	}
+
 	for (int iMissionUnit = 0; iMissionUnit < taPtr->GameingState_Ptr->uniqueIdentifierCount; ++iMissionUnit)
 	{
 		MissionUnitsStruct* missionUnit = &taPtr->GameingState_Ptr->uniqueIdentifiers[iMissionUnit];
@@ -607,8 +725,10 @@ bool MultiplayerSchemaUnits::spawnInitialUnits(PlayerStruct* targetPlayer, int t
 			if (m_spawnedUnits.size() < newUnits.size())
 			{
 				m_spawnedUnits.resize(newUnits.size(), NULL);
+				m_spawnedIndex.resize(newUnits.size(), 0);
 			}
 			m_spawnedUnits[iMissionUnit] = newUnit;
+			m_spawnedIndex[iMissionUnit] = newUnit->UnitInGameIndex;
 		}
 	}
 
@@ -652,38 +772,207 @@ void MultiplayerSchemaUnits::spawnLaterUnits(int gameTime)
 		}
 		else if (missionUnit->Unitname[0] != '\0')
 		{
-			int idxPosition = missionUnit->Player - 1;
-			int idxPlayer = unsigned(idxPosition) < 10 ? m_playersByStartPosition[idxPosition] : -1;
-
-			PlayerStruct* targetPlayer = NULL;
-			if (idxPosition == 10) {
-				targetPlayer = m_neutralPlayer;
-			}
-			else if (unsigned(idxPlayer) < 10) {
-				targetPlayer = &taPtr->Players[idxPlayer];
-			}
-
-			if (missionUnit->Player < 11 && targetPlayer == m_neutralPlayer) {
-				targetPlayer = NULL;
-			}
-
-			if (targetPlayer && InferredPlayerTypeIsLocal(targetPlayer) && !(targetPlayer->PlayerInfo->PropertyMask & WATCH))
+			const GGRule* rule = unsigned(iMissionUnit) < m_rules.size() ? &m_rules[iMissionUnit] : NULL;
+			if (rule && !rule->unless.empty())
 			{
-				UnitStruct* newUnit = DoSpawnUnit(targetPlayer, missionUnit, 0);
-				// T1 (GG): in a mission, a delayed unit runs its InitialMission like one spawned at
-				// the start. Other games keep upstream's behaviour (delayed units get no orders).
-				if (newUnit && isMissionLocked())
+				// Spawn now if the enemy has none of these; otherwise once one it has now dies.
+				std::vector<std::pair<UnitStruct*, short> > watch = EnemyUnitsOfTypes(m_neutralPlayer, rule->unless);
+				IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] %s due at %ds: enemy has %d of its unless-types",
+					rule->name.c_str(), gameTimeSecs, int(watch.size()));
+				if (watch.empty())
 				{
-					if (m_spawnedUnits.size() < taPtr->GameingState_Ptr->uniqueIdentifierCount)
-					{
-						m_spawnedUnits.resize(taPtr->GameingState_Ptr->uniqueIdentifierCount, NULL);
-					}
-					m_spawnedUnits[iMissionUnit] = newUnit;
-					DoParseInitialMissionCommands(iMissionUnit, missionUnit, newUnit, m_spawnedUnits.data());
+					spawnLateEntry(iMissionUnit, gameTimeSecs);
 				}
+				else
+				{
+					m_unlessWatch[iMissionUnit] = watch;
+					m_pending.push_back(iMissionUnit);
+				}
+			}
+			else if (rule && !rule->after.empty())
+			{
+				m_pending.push_back(iMissionUnit);
+			}
+			else
+			{
+				spawnLateEntry(iMissionUnit, gameTimeSecs);
 			}
 		}
 
 		iMissionUnit = peekNextMissionUnit(gameTimeSecs);
+	}
+
+	runDirector(gameTime);
+}
+
+void MultiplayerSchemaUnits::spawnLateEntry(int iMissionUnit, int gameTimeSecs)
+{
+	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
+	MissionUnitsStruct* missionUnit = &taPtr->GameingState_Ptr->uniqueIdentifiers[iMissionUnit];
+
+	int idxPosition = missionUnit->Player - 1;
+	int idxPlayer = unsigned(idxPosition) < 10 ? m_playersByStartPosition[idxPosition] : -1;
+
+	PlayerStruct* targetPlayer = NULL;
+	if (idxPosition == 10) {
+		targetPlayer = m_neutralPlayer;
+	}
+	else if (unsigned(idxPlayer) < 10) {
+		targetPlayer = &taPtr->Players[idxPlayer];
+	}
+
+	if (missionUnit->Player < 11 && targetPlayer == m_neutralPlayer) {
+		targetPlayer = NULL;
+	}
+
+	if (targetPlayer && InferredPlayerTypeIsLocal(targetPlayer) && !(targetPlayer->PlayerInfo->PropertyMask & WATCH))
+	{
+		UnitStruct* newUnit = DoSpawnUnit(targetPlayer, missionUnit, 0);
+		// T1 (GG): in a mission, or on a map with GG rules, a delayed unit runs its InitialMission
+		// like one spawned at the start. Other games keep upstream's behaviour (no orders).
+		if (newUnit && (isMissionLocked() || m_ggMap))
+		{
+			if (m_spawnedUnits.size() < taPtr->GameingState_Ptr->uniqueIdentifierCount)
+			{
+				m_spawnedUnits.resize(taPtr->GameingState_Ptr->uniqueIdentifierCount, NULL);
+				m_spawnedIndex.resize(taPtr->GameingState_Ptr->uniqueIdentifierCount, 0);
+			}
+			m_spawnedUnits[iMissionUnit] = newUnit;
+			m_spawnedIndex[iMissionUnit] = newUnit->UnitInGameIndex;
+			DoParseInitialMissionCommands(iMissionUnit, missionUnit, newUnit, m_spawnedUnits.data());
+			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] spawned %s at %ds",
+				unsigned(iMissionUnit) < m_rules.size() ? m_rules[iMissionUnit].name.c_str() : "?", gameTimeSecs);
+		}
+	}
+}
+
+bool MultiplayerSchemaUnits::isAlive(int iMissionUnit)
+{
+	if (unsigned(iMissionUnit) >= m_spawnedUnits.size() || !m_spawnedUnits[iMissionUnit])
+	{
+		return false;
+	}
+	UnitStruct* unit = m_spawnedUnits[iMissionUnit];
+	return unit->IsUnit && unit->UnitInGameIndex == m_spawnedIndex[iMissionUnit];
+}
+
+int MultiplayerSchemaUnits::findRule(const std::string& name)
+{
+	for (unsigned i = 0; i < m_rules.size(); ++i)
+	{
+		if (_stricmp(m_rules[i].name.c_str(), name.c_str()) == 0)
+		{
+			return int(i);
+		}
+	}
+	return -1;
+}
+
+void MultiplayerSchemaUnits::runDirector(int gameTime)
+{
+	// The '@' rules. Only on the machine that owns the mission's units (the AI's host), twice a
+	// second, from the game tick (never from inside the battleroom proc).
+	if (!m_ggMap || !m_neutralPlayer || !InferredPlayerTypeIsLocal(m_neutralPlayer) || gameTime - m_lastDirectorTick < 15)
+	{
+		return;
+	}
+	m_lastDirectorTick = gameTime;
+	int gameTimeSecs = gameTime / 30;
+	TAdynmemStruct* ta = *(TAdynmemStruct**)0x00511de8;
+
+	// Gated spawns whose condition has come true.
+	for (auto it = m_pending.begin(); it != m_pending.end();)
+	{
+		int i = *it;
+		const GGRule& rule = m_rules[i];
+		bool open = false;
+		if (!rule.unless.empty())
+		{
+			for (const auto& watched : m_unlessWatch[i])
+			{
+				if (!watched.first->IsUnit || watched.first->UnitInGameIndex != watched.second)
+				{
+					open = true;
+				}
+			}
+		}
+		else
+		{
+			int other = findRule(rule.after);
+			open = other >= 0 && m_spawnedUnits[other] && !isAlive(other);
+		}
+		if (open)
+		{
+			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] %s's gate opened at %ds", rule.name.c_str(), gameTimeSecs);
+			it = m_pending.erase(it);
+			spawnLateEntry(i, gameTimeSecs);
+		}
+		else
+		{
+			++it;
+		}
+	}
+
+	// Hunters and escorts.
+	for (unsigned i = 0; i < m_rules.size(); ++i)
+	{
+		const GGRule& rule = m_rules[i];
+		if ((rule.hunt.empty() && rule.escort.empty()) || gameTimeSecs < rule.from || !isAlive(int(i)))
+		{
+			continue;
+		}
+		UnitStruct* unit = m_spawnedUnits[i];
+		UnitStruct* target = NearestEnemyOfTypes(m_neutralPlayer, rule.hunt, unit);
+		ordertype::ORDERTYPE order = ordertype::ATTACK;
+		if (!target && !rule.escort.empty())
+		{
+			// Guard the newest live unit spawned from an entry named PREFIX...
+			for (unsigned j = 0; j < m_rules.size(); ++j)
+			{
+				if (j != i && isAlive(int(j)) && _strnicmp(m_rules[j].name.c_str(), rule.escort.c_str(), rule.escort.size()) == 0)
+				{
+					target = m_spawnedUnits[j];
+				}
+			}
+			order = ordertype::DEFEND;
+		}
+		if (!target)
+		{
+			continue;
+		}
+		bool onIt = unit->UnitOrders && unit->UnitOrders->AttackTargat == target;
+		if (target != m_orderedTarget[i] || (!onIt && gameTime - m_orderedAt[i] >= 150))
+		{
+			SendOrder(unit, target->XPos, target->YPos, target->ZPos, target, order, -1, false);
+			m_orderedTarget[i] = target;
+			m_orderedAt[i] = gameTime;
+			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] %s: %s %s at %ds", rule.name.c_str(),
+				order == ordertype::ATTACK ? "attack" : "guard", ta->UnitDef[target->UnitID].UnitName, gameTimeSecs);
+		}
+	}
+
+	// The anchor goes once nothing is left to come and every other mission unit is dead.
+	if (!m_anchorReleased && m_pending.empty() && m_spawnQueueIterator == m_spawnQueue.end())
+	{
+		int anchor = -1;
+		bool anyAlive = false;
+		for (unsigned i = 0; i < m_rules.size(); ++i)
+		{
+			if (m_rules[i].anchor)
+			{
+				anchor = int(i);
+			}
+			else if (isAlive(int(i)))
+			{
+				anyAlive = true;
+			}
+		}
+		if (anchor >= 0 && !anyAlive && isAlive(anchor))
+		{
+			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] every mission unit is spent at %ds; the anchor self-destructs", gameTimeSecs);
+			m_anchorReleased = true;
+			DoParseInitialMissionCommands(anchor, &ta->GameingState_Ptr->uniqueIdentifiers[anchor],
+				m_spawnedUnits[anchor], m_spawnedUnits.data(), "d");
+		}
 	}
 }

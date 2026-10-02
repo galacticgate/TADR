@@ -681,7 +681,9 @@ struct MissionUnitsStruct {
 	char data1b;				// 0x001b
 	int creationCountdown;		// 0x001c
 	char data20[2];				// 0x0020
-	short Player;	// 1..10	// 0x0022
+	unsigned char Player;		// 0x0022: 1..10, or 11 for the AI
+	unsigned char Flags;		// 0x0023: InitialGroup 0x0f, MissionCritical 0x10, AiIgnore 0x20,
+								//         AiPriorityTarget 0x40, Immunity 0x80 (Open Annihilation)
 };								// 0x0024
 
 struct GameingState{
