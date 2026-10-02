@@ -37,7 +37,8 @@ public:
 	// game. On a map with neutral (Player=11) units the lock keeps the mission's AI in the
 	// battleroom, refuses +spawnoff, and gives delayed units their InitialMission too.
 	bool isMissionLocked();
-	void onBattleroomHostProc(_GUIInfo* gui);	// the host's battleroom, from sharedialog's hook
+	void onBattleroomHostProc(_GUIInfo* gui);	// the host's battleroom events, from sharedialog's hook
+	void onFrame();								// once a frame on the GUI thread, from IDDrawSurface::Unlock
 
 private:
 	MultiplayerSchemaUnits();

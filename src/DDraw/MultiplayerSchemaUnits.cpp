@@ -391,55 +391,87 @@ bool MultiplayerSchemaUnits::isMissionLocked()
 
 void MultiplayerSchemaUnits::onBattleroomHostProc(_GUIInfo* gui)
 {
-	// The battleroom proc runs again inside BattleroomAddAi's faked clicks; ignore those.
-	static bool busy = false;
+	// T4 only. This runs inside TDraw's hook at 0x447b9c, i.e. inside battleroom_OnCommand, and only
+	// when there's a GUI event. Never fake clicks from here: they re-enter battleroom_OnCommand and
+	// so this same hook, whose saved registers are per thread, and TA crashes on return (0x49fd66,
+	// 2026-10-02). Adding the AI is onFrame's job.
 	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
-	if (busy || !gui || !taPtr->GameingState_Ptr || !isMissionLocked() || !mapHasNeutralSpawnUnits())
+	if (!gui || !taPtr->GameingState_Ptr || !isMissionLocked() || !mapHasNeutralSpawnUnits())
 	{
 		return;
 	}
 
+	// A click on the AI's name cycles it out of its slot. TA reads the click (UIChange_f) after this
+	// point, in its per-slot loop, so clearing it here swallows the click.
 	int aiSlot = FindLocalAiSlot();
-	if (aiSlot >= 0)
+	_GUI0IDControl* controls = gui->TheActive_GUIMEM ? gui->TheActive_GUIMEM->ControlsAry : NULL;
+	int clicked = gui->UIChange_f;
+	if (aiSlot >= 0 && controls && clicked > 0 && clicked <= controls->totalgadgets &&
+		std::string("PLAYER") + std::to_string(aiSlot) == controls[clicked].name)
 	{
-		// T4: a click on the AI's name cycles it out of its slot. Swallow it.
-		_GUI0IDControl* controls = gui->TheActive_GUIMEM ? gui->TheActive_GUIMEM->ControlsAry : NULL;
-		int clicked = gui->UIChange_f;
-		if (controls && clicked > 0 && clicked <= controls->totalgadgets &&
-			std::string("PLAYER") + std::to_string(aiSlot) == controls[clicked].name)
-		{
-			gui->UIChange_f = -1;
-			gui->GUIUpdated_b = 0;
-			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::onBattleroomHostProc] ignored a click on the mission AI's slot %d", aiSlot);
-		}
+		gui->UIChange_f = -1;
+		gui->GUIUpdated_b = 0;
+		IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::onBattleroomHostProc] ignored a click on the mission AI's slot %d", aiSlot);
+	}
+}
+
+// GG: is the active GUI the multiplayer battleroom? It alone has both a PLAYER0 and a LOGO0 control.
+static bool IsBattleroomActive()
+{
+	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
+	_GUI0IDControl* controls = taPtr->desktopGUI.TheActive_GUIMEM ? taPtr->desktopGUI.TheActive_GUIMEM->ControlsAry : NULL;
+	if (!controls)
+	{
+		return false;
+	}
+	bool player0 = false;
+	bool logo0 = false;
+	for (int i = 1; i <= controls->totalgadgets; ++i)
+	{
+		player0 = player0 || std::string("PLAYER0") == controls[i].name;
+		logo0 = logo0 || std::string("LOGO0") == controls[i].name;
+	}
+	return player0 && logo0;
+}
+
+void MultiplayerSchemaUnits::onFrame()
+{
+	// T3: add the mission's AI as soon as the host is in the battleroom, so the first Start isn't
+	// swallowed. Called once a frame on the GUI thread (IDDrawSurface::Unlock), outside any hook,
+	// the same way upstream fakes these clicks from its Start hook rather than from the proc's own.
+	if (!isMissionLocked() || DataShare->PlayingDemo)
+	{
 		return;
 	}
-
-	// T3: add the AI as soon as the host is in the battleroom, so the first Start isn't swallowed.
+	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
+	if (!taPtr->GameingState_Ptr || !mapHasNeutralSpawnUnits() || FindLocalAiSlot() >= 0)
+	{
+		return;
+	}
+	PlayerInfoStruct* localInfo = taPtr->Players[taPtr->LocalHumanPlayer_PlayerID].PlayerInfo;
+	if (!localInfo || !(localInfo->SharedBits & IsHost))
+	{
+		return;
+	}
 	// The new AI may not show in Players[] at once; don't add a second one meanwhile.
 	DWORD now = GetTickCount();
 	if (m_lastAiAddTicks != 0 && now - m_lastAiAddTicks < 3000)
 	{
 		return;
 	}
+	if (!IsBattleroomActive())
+	{
+		return;
+	}
 	m_lastAiAddTicks = now;
 
-	// The faked clicks go through the desktop GUI; put back whatever event this proc call is handling.
 	GUIInfo* desktop = &taPtr->desktopGUI;
-	int savedChange = gui->UIChange_f;
-	int savedUpdated = gui->GUIUpdated_b;
-	int savedDesktopChange = desktop->UIChange_f;
-	int savedDesktopUpdated = desktop->GUIUpdated_b;
-	busy = true;
+	int savedChange = desktop->UIChange_f;
+	int savedUpdated = desktop->GUIUpdated_b;
 	bool added = BattleroomAddAi("PLAYER", 2);
-	busy = false;
-	desktop->UIChange_f = savedDesktopChange;
-	desktop->GUIUpdated_b = savedDesktopUpdated;
-	gui->UIChange_f = savedChange;
-	gui->GUIUpdated_b = savedUpdated;
-	// No chat line here: SendText from inside the battleroom proc re-enters it with no GUI and TA
-	// crashes in IsPressCommand (0x49fd66, 2026-10-02). The ghost watcher reports the mission's state.
-	IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::onBattleroomHostProc] mission AI added=%d", int(added));
+	desktop->UIChange_f = savedChange;
+	desktop->GUIUpdated_b = savedUpdated;
+	IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::onFrame] mission AI added=%d", int(added));
 }
 
 bool MultiplayerSchemaUnits::mapHasSpawnUnits()

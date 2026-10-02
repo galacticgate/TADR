@@ -13,6 +13,7 @@ using namespace std;
 #include "ChallengeResponse.h"
 #include "ConstructionKickout.h"
 #include "TenPlayerReplay.h"
+#include "MultiplayerSchemaUnits.h"
 #include "whiteboard.h"
 #include "MinimapHandler.h"
 #include "dddta.h"
@@ -533,6 +534,7 @@ HRESULT __stdcall IDDrawSurface::Unlock(LPVOID arg1)
 	}
 
 	UpdateTAProcess ( );
+	MultiplayerSchemaUnits::GetInstance()->onFrame();	// GG placement missions
 	if (GetCurrentThreadId() == LocalShare->GuiThreadId && DataShare->PlayingDemo)
 	{
 		TenPlayerReplay::GetInstance();
