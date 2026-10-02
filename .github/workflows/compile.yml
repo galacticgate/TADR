@@ -28,6 +28,12 @@ jobs:
       run: |
         msbuild src/DDraw/ddraw.vcxproj /p:Configuration=ReleasePublic /p:Platform=x86
 
+    # The runner's MSVC toolset drifts; newer ones import Win8+ APIs that stop the DLL loading
+    # on Windows 7 (upstream's check, from TADR master).
+    - name: Verify Windows 7 compatibility
+      run: |
+        python src/DDraw/tools/check_win7_imports.py src/DDraw/Public/tdraw.dll
+
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
