@@ -20,7 +20,9 @@ struct _GUIInfo;
 //   NAME@after=OTHER             spawn once the unit spawned from entry OTHER is dead
 //   NAME@from=100|hunt=A,B|escort=PREFIX
 //                                from that game second: attack the nearest enemy A or B; with none,
-//                                guard the newest live unit whose entry name starts with PREFIX
+//                                guard the newest live unit whose entry name starts with PREFIX.
+//                                hunt=* is any enemy unit that doesn't fly; such a hunter keeps its
+//                                target until it dies or something twice as close turns up
 //   NAME@anchor                  keeps its owner in the game; self-destructs once every other
 //                                mission unit has spawned and died, so the game can end
 // Stock TDraw ignores all of it: to TA the Ident is only a label.
@@ -31,6 +33,7 @@ struct GGRule
 	int from = -1;
 	std::vector<std::string> unless;
 	std::vector<std::string> hunt;
+	bool huntAny = false;		// hunt holds "*"
 	std::string after;
 	std::string escort;
 	bool anchor = false;
@@ -89,6 +92,7 @@ private:
 	std::vector<int> m_pending;						// late entries waiting for their gate
 	std::map<int, std::vector<std::pair<UnitStruct*, short> > > m_unlessWatch;
 	std::vector<UnitStruct*> m_orderedTarget;		// the director's last target, by mission unit
+	std::vector<short> m_orderedTargetIndex;		// that target's UnitInGameIndex, to tell a reused slot
 	std::vector<int> m_orderedAt;					// and when it gave that order (game ticks)
 	bool m_ggMap;									// the map has GGMSG entries or '@' rules
 	bool m_anchorReleased;

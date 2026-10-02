@@ -148,6 +148,7 @@ static int FindLocalAiSlot()
 
 // GG director: the finished units of these types that belong to players at war with `self`
 // (every human that is not watching), with each one's slot index to tell a reused slot later.
+// The type "*" stands for any unit that doesn't fly: ground units and buildings.
 static std::vector<std::pair<UnitStruct*, short> > EnemyUnitsOfTypes(PlayerStruct* self, const std::vector<std::string>& types)
 {
 	std::vector<std::pair<UnitStruct*, short> > found;
@@ -172,10 +173,10 @@ static std::vector<std::pair<UnitStruct*, short> > EnemyUnitsOfTypes(PlayerStruc
 			{
 				continue;
 			}
-			const char* name = taPtr->UnitDef[unit->UnitID].UnitName;
+			const UnitDefStruct& def = taPtr->UnitDef[unit->UnitID];
 			for (const std::string& type : types)
 			{
-				if (_stricmp(name, type.c_str()) == 0)
+				if (type == "*" ? !(def.UnitTypeMask_0 & canfly) : _stricmp(def.UnitName, type.c_str()) == 0)
 				{
 					found.push_back(std::make_pair(unit, unit->UnitInGameIndex));
 					break;
@@ -186,15 +187,20 @@ static std::vector<std::pair<UnitStruct*, short> > EnemyUnitsOfTypes(PlayerStruc
 	return found;
 }
 
-static UnitStruct* NearestEnemyOfTypes(PlayerStruct* self, const std::vector<std::string>& types, UnitStruct* from)
+static double SquaredDistance(const UnitStruct* a, const UnitStruct* b)
+{
+	double dx = double(a->XPos) - double(b->XPos);
+	double dz = double(a->ZPos) - double(b->ZPos);
+	return dx * dx + dz * dz;
+}
+
+static UnitStruct* NearestOf(const std::vector<std::pair<UnitStruct*, short> >& candidates, UnitStruct* from)
 {
 	UnitStruct* best = NULL;
 	double bestDistance = 0.0;
-	for (const auto& found : EnemyUnitsOfTypes(self, types))
+	for (const auto& found : candidates)
 	{
-		double dx = double(found.first->XPos) - double(from->XPos);
-		double dz = double(found.first->ZPos) - double(from->ZPos);
-		double distance = dx * dx + dz * dz;
+		double distance = SquaredDistance(found.first, from);
 		if (!best || distance < bestDistance)
 		{
 			best = found.first;
@@ -202,6 +208,28 @@ static UnitStruct* NearestEnemyOfTypes(PlayerStruct* self, const std::vector<std
 		}
 	}
 	return best;
+}
+
+// GG: a chat line for every other TA instance in the game, shown as it is (no sender's name), the
+// way ChallengeResponse.cpp sends its reports. SendText only shows a line locally. Nothing is sent
+// without a remote player (a skirmish, say).
+static void BroadcastChatLine(const char* text)
+{
+	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
+	bool anyRemote = false;
+	for (int i = 0; i < 10; ++i)
+	{
+		anyRemote = anyRemote || (taPtr->Players[i].PlayerActive && taPtr->Players[i].My_PlayerType == Player_RemoteHuman);
+	}
+	if (!anyRemote)
+	{
+		return;
+	}
+	char buffer[65] = { 0 };
+	buffer[0] = 0x05;	// chat
+	strncpy(buffer + 1, text, sizeof(buffer) - 2);
+	unsigned fromDpid = taPtr->Players[taPtr->LocalHumanPlayer_PlayerID].DirectPlayID;
+	HAPI_BroadcastMessage(fromDpid, buffer, sizeof(buffer));
 }
 
 static unsigned int InitMissionUnitSpawnQueueAddr = 0x49759f;
@@ -566,6 +594,7 @@ void MultiplayerSchemaUnits::initMissionUnitSpawnQueue(void)
 	m_spawnedUnits.assign(count, NULL);
 	m_spawnedIndex.assign(count, 0);
 	m_orderedTarget.assign(count, NULL);
+	m_orderedTargetIndex.assign(count, 0);
 	m_orderedAt.assign(count, 0);
 	m_pending.clear();
 	m_unlessWatch.clear();
@@ -609,7 +638,14 @@ void MultiplayerSchemaUnits::initMissionUnitSpawnQueue(void)
 			std::string key = term.substr(0, eq);
 			std::string value = eq == std::string::npos ? "" : term.substr(eq + 1);
 			if (key == "unless") rule.unless = split(value, ',');
-			else if (key == "hunt") rule.hunt = split(value, ',');
+			else if (key == "hunt")
+			{
+				rule.hunt = split(value, ',');
+				for (const std::string& type : rule.hunt)
+				{
+					rule.huntAny = rule.huntAny || type == "*";
+				}
+			}
 			else if (key == "after") rule.after = value;
 			else if (key == "escort") rule.escort = value;
 			else if (key == "from") rule.from = atoi(value.c_str());
@@ -757,9 +793,10 @@ void MultiplayerSchemaUnits::spawnLaterUnits(int gameTime)
 		if (_stricmp(missionUnit->Unitname, "GGMSG") == 0)
 		{
 			// GG mission message: a schema entry with no real unit, its text in Ident and its time
-			// in CreationCountdown. Shown once, locally, to whoever owns its Player (the AI's host,
-			// i.e. the player), from the game tick, never from inside the battleroom proc. Stock
-			// TDraw finds no unit called GGMSG and skips the entry, so such maps stay playable.
+			// in CreationCountdown. Shown once by whoever owns its Player (the AI's host), from the
+			// game tick, never from inside the battleroom proc, and sent on to every other TA
+			// instance so a whole team sees it. Stock TDraw finds no unit called GGMSG and skips
+			// the entry, so such maps stay playable.
 			int idxPosition = missionUnit->Player - 1;
 			int idxPlayer = unsigned(idxPosition) < 10 ? m_playersByStartPosition[idxPosition] : -1;
 			PlayerStruct* owner = idxPosition == 10 ? m_neutralPlayer
@@ -768,6 +805,7 @@ void MultiplayerSchemaUnits::spawnLaterUnits(int gameTime)
 			{
 				IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::spawnLaterUnits] message at %ds: %s", gameTimeSecs, missionUnit->Ident);
 				SendText(missionUnit->Ident, 0);
+				BroadcastChatLine(missionUnit->Ident);
 			}
 		}
 		else if (missionUnit->Unitname[0] != '\0')
@@ -913,7 +951,9 @@ void MultiplayerSchemaUnits::runDirector(int gameTime)
 		}
 	}
 
-	// Hunters and escorts.
+	// Hunters and escorts. The enemy's units are listed once a pass for each hunt list, not once a
+	// hunter: a wave of a hundred hunters would otherwise read every unit slot a hundred times.
+	std::map<std::string, std::vector<std::pair<UnitStruct*, short> > > enemiesByHunt;
 	for (unsigned i = 0; i < m_rules.size(); ++i)
 	{
 		const GGRule& rule = m_rules[i];
@@ -922,7 +962,31 @@ void MultiplayerSchemaUnits::runDirector(int gameTime)
 			continue;
 		}
 		UnitStruct* unit = m_spawnedUnits[i];
-		UnitStruct* target = NearestEnemyOfTypes(m_neutralPlayer, rule.hunt, unit);
+		UnitStruct* target = NULL;
+		if (!rule.hunt.empty())
+		{
+			std::string key;
+			for (const std::string& type : rule.hunt)
+			{
+				key += type + ",";
+			}
+			auto enemies = enemiesByHunt.find(key);
+			if (enemies == enemiesByHunt.end())
+			{
+				enemies = enemiesByHunt.insert(std::make_pair(key, EnemyUnitsOfTypes(m_neutralPlayer, rule.hunt))).first;
+			}
+			target = NearestOf(enemies->second, unit);
+
+			// A hunter of anything keeps its target while it lives, unless something twice as close
+			// turns up, so a wave doesn't switch targets twice a second as everything moves.
+			UnitStruct* current = m_orderedTarget[i];
+			if (rule.huntAny && target && current && current != target &&
+				current->IsUnit && current->UnitInGameIndex == m_orderedTargetIndex[i] &&
+				4.0 * SquaredDistance(target, unit) > SquaredDistance(current, unit))
+			{
+				target = current;
+			}
+		}
 		ordertype::ORDERTYPE order = ordertype::ATTACK;
 		if (!target && !rule.escort.empty())
 		{
@@ -945,6 +1009,7 @@ void MultiplayerSchemaUnits::runDirector(int gameTime)
 		{
 			SendOrder(unit, target->XPos, target->YPos, target->ZPos, target, order, -1, false);
 			m_orderedTarget[i] = target;
+			m_orderedTargetIndex[i] = target->UnitInGameIndex;
 			m_orderedAt[i] = gameTime;
 			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] %s: %s %s at %ds", rule.name.c_str(),
 				order == ordertype::ATTACK ? "attack" : "guard", ta->UnitDef[target->UnitID].UnitName, gameTimeSecs);
