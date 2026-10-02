@@ -8,6 +8,7 @@
 #include "GameTickHook.h"
 
 #include <set>
+#include <string.h>
 #include <string>
 
 #ifdef min
