@@ -9,7 +9,7 @@
 
 namespace
 {
-	const char* const BUILD = "2025.12.13.3-apm";
+	const char* const BUILD = "2025.12.13.4-apm";
 
 	// Leaving the game screen this long (or a new game starting) ends the game. Shorter gaps are
 	// treated as the same game, in case an in-game menu leaves the game screen for a moment.
@@ -64,6 +64,7 @@ namespace
 	int repostedClicks = 0;
 	int wheelDelta = 0;
 	int lastWheelDirection = 0;
+	int lastForeground = -1;     // -1 until the first message
 	DWORD lastWheelMs = 0;
 
 	void OpenLog()
@@ -227,10 +228,22 @@ namespace ApmCounter
 			minuteTime = now;
 		}
 
+		// WM_ACTIVATEAPP may never get here (in fullscreen DirectDraw handles activation), so a
+		// change of foreground between two messages is logged as well.
+		int foreground = GetForegroundWindow() == hwnd ? 1 : 0;
+		if (foreground != lastForeground)
+		{
+			char line[64];
+			_snprintf_s(line, sizeof(line), _TRUNCATE, "FOCUS %s %02d:%02d:%02d seen", foreground ? "on" : "off",
+				now.wHour, now.wMinute, now.wSecond);
+			WriteLine(line);
+			lastForeground = foreground;
+		}
+
 		if (msg == WM_ACTIVATEAPP)
 		{
 			char line[64];
-			_snprintf_s(line, sizeof(line), _TRUNCATE, "FOCUS %s %02d:%02d:%02d", wParam ? "on" : "off",
+			_snprintf_s(line, sizeof(line), _TRUNCATE, "FOCUS %s %02d:%02d:%02d activateapp", wParam ? "on" : "off",
 				now.wHour, now.wMinute, now.wSecond);
 			WriteLine(line);
 			return;
@@ -295,7 +308,7 @@ namespace ApmCounter
 		}
 
 		// Desktop APM credits actions to the application in the foreground.
-		if (!p.Any() || GetForegroundWindow() != hwnd)
+		if (!p.Any() || !foreground)
 		{
 			return;
 		}
