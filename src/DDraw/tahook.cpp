@@ -13,6 +13,7 @@
 #include "hook\etc.h"
 #include "hook\hook.h"
 #include "tahook.h"
+#include "ApmCounter.h"
 #include "TAConfig.h"
 
 #include "fullscreenminimap.h"
@@ -541,6 +542,7 @@ bool CTAHook::Message(HWND WinProcWnd, UINT Msg, WPARAM wParam, LPARAM lParam)
 				if (DraggingUnitOrders != NULL && DraggingUnitOrdersState == DraggingOrderStateEnum::PRIMED_TO_DRAG)
 				{
 					DraggingUnitOrdersState = DraggingOrderStateEnum::CLICK_NOT_DRAG;
+					ApmCounter::SkipRepostedClick();
 					PostMessage(WinProcWnd, WM_LBUTTONDOWN, wParam, lParam);
 					PostMessage(WinProcWnd, WM_LBUTTONUP, wParam, lParam);
 					return true;

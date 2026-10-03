@@ -10,6 +10,7 @@ using namespace std;
 #include "tamem.h"
 #include "tafunctions.h"
 
+#include "ApmCounter.h"
 #include "ChallengeResponse.h"
 #include "ConstructionKickout.h"
 #include "TenPlayerReplay.h"
@@ -1092,6 +1093,7 @@ LRESULT CALLBACK _WinProc(HWND WinProcWnd, UINT Msg, WPARAM wParam, LPARAM lPara
     __try
 	{
 		UpdateTAProcess ( );
+		ApmCounter::OnMessage ( WinProcWnd, Msg, wParam, lParam);
 		if (NULL!=FixTABug)
 		{
 			FixTABug->AntiCheat ( );

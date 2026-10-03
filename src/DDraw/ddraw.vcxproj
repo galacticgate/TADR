@@ -309,6 +309,7 @@ if NOT "$(LocalDebuggerWorkingDirectory)" == "$(ProjectDir)" if exist "$(LocalDe
   <ItemGroup>
     <ClCompile Include="AutoTeam.cpp" />
     <ClCompile Include="BattleroomCommands.cpp" />
+    <ClCompile Include="ApmCounter.cpp" />
     <ClCompile Include="ChallengeResponse.cpp" />
     <ClCompile Include="ConstructionKickout.cpp" />
     <ClCompile Include="GameTickHook.cpp" />
@@ -331,6 +332,7 @@ if NOT "$(LocalDebuggerWorkingDirectory)" == "$(ProjectDir)" if exist "$(LocalDe
     <ClCompile Include="Widgets\Widget.cpp" />
     <ClInclude Include="AutoTeam.h" />
     <ClInclude Include="BattleroomCommands.h" />
+    <ClInclude Include="ApmCounter.h" />
     <ClInclude Include="ChallengeResponse.h" />
     <ClInclude Include="ConstructionKickout.h" />
     <ClInclude Include="GameTickHook.h" />

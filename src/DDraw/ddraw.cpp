@@ -13,6 +13,7 @@ using namespace std;
 #include "hook/hook.h"
 #include "UnicodeSupport.h"
 #include "MenuResolution.h"
+#include "ApmCounter.h"
 #include "ChallengeResponse.h"
 
 #include "tamem.h"
@@ -126,6 +127,7 @@ int __stdcall AddtionInitAfterDDraw (PInlineX86StackBuffer X86StrackBuffer)
 }
 void AddtionReleaseAfterDDraw (void)
 {
+	ApmCounter::Flush ( );
 	SetWindowLong ( (*TAProgramStruct_PtrPtr)->TAClass_Hwnd, GWL_WNDPROC, (long)LocalShare->TAWndProc);
 	if (NULL!=NowSupportUnicode)
 	{
