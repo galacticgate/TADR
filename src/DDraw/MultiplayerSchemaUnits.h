@@ -18,6 +18,8 @@ struct _GUIInfo;
 //   NAME@unless=ARMFIG,CORVENG   spawn at CreationCountdown if the enemy has none of these types;
 //                                otherwise once the first of the ones it had then dies
 //   NAME@after=OTHER             spawn once the unit spawned from entry OTHER is dead
+//   NAME@after=W03*              spawn once every entry whose name starts with W03 has spawned and
+//                                died (a whole wave); an entry still to come keeps it waiting
 //   NAME@from=100|hunt=A,B|escort=PREFIX
 //                                from that game second: attack the nearest enemy A or B; with none,
 //                                guard the newest live unit whose entry name starts with PREFIX.
@@ -27,6 +29,10 @@ struct _GUIInfo;
 //                                mission unit has spawned and died, so the game can end
 //   NAME@anchor|tell=5           also, once nothing is left to come, tells the team how many enemy
 //                                units are left, and where, whenever 5 or fewer remain
+// Two kinds of entry aren't units, and take the same gates (unless=, after=):
+//   Unitname=GGMSG, Ident=TEXT   shows TEXT (up to any '@') to the whole team at CreationCountdown
+//   Unitname=GGCLEAR             removes every wreck and heap on the map, for every player, as if
+//                                each had been reclaimed (nobody gets the metal)
 // Stock TDraw ignores all of it: to TA the Ident is only a label.
 struct GGRule
 {
@@ -87,14 +93,22 @@ private:
 	int m_missionLock;							// -1 until TAForever.ini is read
 	DWORD m_lastAiAddTicks;
 
+	void fireEntry(int iMissionUnit, int gameTimeSecs);	// a due entry: message, wreck clear or unit
 	void spawnLateEntry(int iMissionUnit, int gameTimeSecs);
 	bool isAlive(int iMissionUnit);
+	bool isDone(int iMissionUnit);						// spawned and dead, or never to be
+	bool afterGateOpen(const std::string& after);
 	int findRule(const std::string& name);
+	void queueWreckClear(int gameTimeSecs);
+	void clearQueuedWrecks();
 	std::vector<GGRule> m_rules;					// by mission unit index
 	// A unit's type (UnitID) when it was spawned. TA reuses a dead unit's slot, and UnitInGameIndex
-	// is the slot's own number, so only a changed type shows a slot now holds another unit; a new
-	// mission unit of the same type clears the earlier entry when it's spawned (spawnLateEntry).
+	// is the slot's own number, so only a changed type shows a slot now holds another unit, and an
+	// entry once seen dead stays dead (m_gone); spawnLateEntry marks earlier entries in a reused slot.
 	std::vector<short> m_spawnedType;
+	std::vector<char> m_gone;						// by mission unit index: died, or couldn't be made
+	std::vector<char> m_wreckTypes;					// by feature type: a corpse or its heap
+	std::vector<std::pair<int, int> > m_wreckQueue;	// cells of wrecks a GGCLEAR still has to take
 	std::vector<int> m_pending;						// late entries waiting for their gate
 	std::map<int, std::vector<std::pair<UnitStruct*, short> > > m_unlessWatch;	// with each unit's type
 	std::vector<UnitStruct*> m_orderedTarget;		// the director's last target, by mission unit

@@ -211,26 +211,50 @@ static UnitStruct* NearestOf(const std::vector<std::pair<UnitStruct*, short> >& 
 	return best;
 }
 
-// GG: a chat line for every other TA instance in the game, shown as it is (no sender's name), the
-// way ChallengeResponse.cpp sends its reports. SendText only shows a line locally. Nothing is sent
-// without a remote player (a skirmish, say).
-static void BroadcastChatLine(const char* text)
+// GG: whether another TA instance is in the game, to send to. Not in a skirmish, say.
+static bool AnyRemotePlayer()
 {
 	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
-	bool anyRemote = false;
 	for (int i = 0; i < 10; ++i)
 	{
-		anyRemote = anyRemote || (taPtr->Players[i].PlayerActive && taPtr->Players[i].My_PlayerType == Player_RemoteHuman);
+		if (taPtr->Players[i].PlayerActive && taPtr->Players[i].My_PlayerType == Player_RemoteHuman)
+		{
+			return true;
+		}
 	}
-	if (!anyRemote)
+	return false;
+}
+
+// GG: a chat line for every other TA instance in the game, shown as it is (no sender's name), the
+// way ChallengeResponse.cpp sends its reports. SendText only shows a line locally.
+static void BroadcastChatLine(const char* text)
+{
+	if (!AnyRemotePlayer())
 	{
 		return;
 	}
+	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
 	char buffer[65] = { 0 };
 	buffer[0] = 0x05;	// chat
 	strncpy(buffer + 1, text, sizeof(buffer) - 2);
 	unsigned fromDpid = taPtr->Players[taPtr->LocalHumanPlayer_PlayerID].DirectPlayID;
 	HAPI_BroadcastMessage(fromDpid, buffer, sizeof(buffer));
+}
+
+// GG: takes the feature over a cell away as reclaimed, here and on every other TA instance: what
+// TA does when a unit finishes reclaiming one (0x4237d0), less the credit. The others run the same
+// FEATURES_Reclaimed from their 0x0F handler, and the packet is TA's own: 0F, FF (reclaimed), cell
+// x and cell z as 16-bit words.
+static void ReclaimFeatureEverywhere(int cellX, int cellZ, bool anyRemote)
+{
+	FEATURES_Reclaimed(cellX, cellZ, 1);
+	if (anyRemote)
+	{
+		TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
+		char packet[6] = { 0x0f, char(0xff), char(cellX & 0xff), char(cellX >> 8), char(cellZ & 0xff), char(cellZ >> 8) };
+		unsigned fromDpid = taPtr->Players[taPtr->LocalHumanPlayer_PlayerID].DirectPlayID;
+		HAPI_BroadcastMessage(fromDpid, packet, sizeof(packet));
+	}
 }
 
 // GG: a line for the whole team: shown here and sent on to every other TA instance.
@@ -618,6 +642,9 @@ void MultiplayerSchemaUnits::initMissionUnitSpawnQueue(void)
 	unsigned count = taPtr->GameingState_Ptr->uniqueIdentifierCount;
 	m_spawnedUnits.assign(count, NULL);
 	m_spawnedType.assign(count, 0);
+	m_gone.assign(count, 0);
+	m_wreckTypes.clear();
+	m_wreckQueue.clear();
 	m_orderedTarget.assign(count, NULL);
 	m_orderedTargetType.assign(count, 0);
 	m_orderedAt.assign(count, 0);
@@ -633,7 +660,7 @@ void MultiplayerSchemaUnits::initMissionUnitSpawnQueue(void)
 	for (unsigned i = 0; i < count; ++i)
 	{
 		MissionUnitsStruct* missionUnit = &taPtr->GameingState_Ptr->uniqueIdentifiers[i];
-		if (_stricmp(missionUnit->Unitname, "GGMSG") == 0)
+		if (_stricmp(missionUnit->Unitname, "GGMSG") == 0 || _stricmp(missionUnit->Unitname, "GGCLEAR") == 0)
 		{
 			m_ggMap = true;
 		}
@@ -789,6 +816,7 @@ bool MultiplayerSchemaUnits::spawnInitialUnits(PlayerStruct* targetPlayer, int t
 			{
 				m_spawnedUnits.resize(newUnits.size(), NULL);
 				m_spawnedType.resize(newUnits.size(), 0);
+				m_gone.resize(newUnits.size(), 0);
 			}
 			m_spawnedUnits[iMissionUnit] = newUnit;
 			m_spawnedType[iMissionUnit] = newUnit->UnitID;
@@ -817,36 +845,19 @@ void MultiplayerSchemaUnits::spawnLaterUnits(int gameTime)
 	{
 		popMissionUnit();
 		MissionUnitsStruct* missionUnit = &taPtr->GameingState_Ptr->uniqueIdentifiers[iMissionUnit];
-		if (_stricmp(missionUnit->Unitname, "GGMSG") == 0)
+		if (missionUnit->Unitname[0] != '\0')
 		{
-			// GG mission message: a schema entry with no real unit, its text in Ident and its time
-			// in CreationCountdown. Shown once by whoever owns its Player (the AI's host), from the
-			// game tick, never from inside the battleroom proc, and sent on to every other TA
-			// instance so a whole team sees it. Stock TDraw finds no unit called GGMSG and skips
-			// the entry, so such maps stay playable.
-			int idxPosition = missionUnit->Player - 1;
-			int idxPlayer = unsigned(idxPosition) < 10 ? m_playersByStartPosition[idxPosition] : -1;
-			PlayerStruct* owner = idxPosition == 10 ? m_neutralPlayer
-				: unsigned(idxPlayer) < 10 ? &taPtr->Players[idxPlayer] : NULL;
-			if (owner && InferredPlayerTypeIsLocal(owner) && missionUnit->Ident && missionUnit->Ident[0] != '\0')
-			{
-				IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits::spawnLaterUnits] message at %ds: %s", gameTimeSecs, missionUnit->Ident);
-				SendText(missionUnit->Ident, 0);
-				BroadcastChatLine(missionUnit->Ident);
-			}
-		}
-		else if (missionUnit->Unitname[0] != '\0')
-		{
+			// Units, GGMSG messages and GGCLEAR wreck clears alike: due now, unless a gate holds them.
 			const GGRule* rule = unsigned(iMissionUnit) < m_rules.size() ? &m_rules[iMissionUnit] : NULL;
 			if (rule && !rule->unless.empty())
 			{
-				// Spawn now if the enemy has none of these; otherwise once one it has now dies.
+				// Go now if the enemy has none of these; otherwise once one it has now dies.
 				std::vector<std::pair<UnitStruct*, short> > watch = EnemyUnitsOfTypes(m_neutralPlayer, rule->unless);
 				IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] %s due at %ds: enemy has %d of its unless-types",
 					rule->name.c_str(), gameTimeSecs, int(watch.size()));
 				if (watch.empty())
 				{
-					spawnLateEntry(iMissionUnit, gameTimeSecs);
+					fireEntry(iMissionUnit, gameTimeSecs);
 				}
 				else
 				{
@@ -860,7 +871,7 @@ void MultiplayerSchemaUnits::spawnLaterUnits(int gameTime)
 			}
 			else
 			{
-				spawnLateEntry(iMissionUnit, gameTimeSecs);
+				fireEntry(iMissionUnit, gameTimeSecs);
 			}
 		}
 
@@ -868,6 +879,44 @@ void MultiplayerSchemaUnits::spawnLaterUnits(int gameTime)
 	}
 
 	runDirector(gameTime);
+}
+
+void MultiplayerSchemaUnits::fireEntry(int iMissionUnit, int gameTimeSecs)
+{
+	TAdynmemStruct* taPtr = *(TAdynmemStruct**)0x00511de8;
+	MissionUnitsStruct* missionUnit = &taPtr->GameingState_Ptr->uniqueIdentifiers[iMissionUnit];
+	bool message = _stricmp(missionUnit->Unitname, "GGMSG") == 0;
+	bool clear = _stricmp(missionUnit->Unitname, "GGCLEAR") == 0;
+	if (!message && !clear)
+	{
+		spawnLateEntry(iMissionUnit, gameTimeSecs);
+		return;
+	}
+
+	// GG mission message (GGMSG) or wreck clear (GGCLEAR): a schema entry with no real unit, due at
+	// its CreationCountdown, and at its gate if it has one. Acted on once, by whoever owns its
+	// Player (the AI's host), from the game tick, never from inside the battleroom proc. Stock
+	// TDraw finds no unit by either name and skips the entry, so such maps stay playable.
+	int idxPosition = missionUnit->Player - 1;
+	int idxPlayer = unsigned(idxPosition) < 10 ? m_playersByStartPosition[idxPosition] : -1;
+	PlayerStruct* owner = idxPosition == 10 ? m_neutralPlayer
+		: unsigned(idxPlayer) < 10 ? &taPtr->Players[idxPlayer] : NULL;
+	if (!owner || !InferredPlayerTypeIsLocal(owner))
+	{
+		return;
+	}
+	if (clear)
+	{
+		queueWreckClear(gameTimeSecs);
+		return;
+	}
+	// A message's text is its Ident up to any '@', so a message can wait on a gate like a unit.
+	std::string text = unsigned(iMissionUnit) < m_rules.size() ? m_rules[iMissionUnit].name : std::string();
+	if (!text.empty())
+	{
+		IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] message at %ds: %s", gameTimeSecs, text.c_str());
+		TellTeam(text.c_str());
+	}
 }
 
 void MultiplayerSchemaUnits::spawnLateEntry(int iMissionUnit, int gameTimeSecs)
@@ -895,26 +944,46 @@ void MultiplayerSchemaUnits::spawnLateEntry(int iMissionUnit, int gameTimeSecs)
 		UnitStruct* newUnit = DoSpawnUnit(targetPlayer, missionUnit, 0);
 		// T1 (GG): in a mission, or on a map with GG rules, a delayed unit runs its InitialMission
 		// like one spawned at the start. Other games keep upstream's behaviour (no orders).
-		if (newUnit && (isMissionLocked() || m_ggMap))
+		if (isMissionLocked() || m_ggMap)
 		{
-			if (m_spawnedUnits.size() < taPtr->GameingState_Ptr->uniqueIdentifierCount)
+			unsigned count = taPtr->GameingState_Ptr->uniqueIdentifierCount;
+			if (m_spawnedUnits.size() < count)
 			{
-				m_spawnedUnits.resize(taPtr->GameingState_Ptr->uniqueIdentifierCount, NULL);
-				m_spawnedType.resize(taPtr->GameingState_Ptr->uniqueIdentifierCount, 0);
+				m_spawnedUnits.resize(count, NULL);
+				m_spawnedType.resize(count, 0);
+				m_gone.resize(count, 0);
+			}
+			if (!newUnit)
+			{
+				// It will never come, so a gate waiting on it (after=W03*) mustn't wait forever.
+				m_gone[iMissionUnit] = 1;
+				IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] %s could not be made at %ds",
+					unsigned(iMissionUnit) < m_rules.size() ? m_rules[iMissionUnit].name.c_str() : "?", gameTimeSecs);
+				return;
 			}
 			// TA hands a dead unit's slot to the next unit it creates, so an earlier entry whose
-			// unit lived in this slot is dead, not alive again (the zombie test's anchor waited on
-			// eight such names for one Zeus, 2026-10-02).
+			// unit lived in this slot is dead for good, not alive again (the zombie test's anchor
+			// waited on eight such names for one Zeus, 2026-10-02).
 			for (unsigned j = 0; j < m_spawnedUnits.size(); ++j)
 			{
 				if (m_spawnedUnits[j] == newUnit)
 				{
-					m_spawnedUnits[j] = NULL;
+					m_gone[j] = 1;
 				}
 			}
 			m_spawnedUnits[iMissionUnit] = newUnit;
 			m_spawnedType[iMissionUnit] = newUnit->UnitID;
-			DoParseInitialMissionCommands(iMissionUnit, missionUnit, newUnit, m_spawnedUnits.data());
+			m_gone[iMissionUnit] = 0;
+			// Its script may name earlier units: only the ones still alive, never a slot's new tenant.
+			std::vector<UnitStruct*> named(m_spawnedUnits);
+			for (unsigned j = 0; j < named.size(); ++j)
+			{
+				if (j != unsigned(iMissionUnit) && !isAlive(int(j)))
+				{
+					named[j] = NULL;
+				}
+			}
+			DoParseInitialMissionCommands(iMissionUnit, missionUnit, newUnit, named.data());
 			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] spawned %s at %ds",
 				unsigned(iMissionUnit) < m_rules.size() ? m_rules[iMissionUnit].name.c_str() : "?", gameTimeSecs);
 		}
@@ -923,12 +992,115 @@ void MultiplayerSchemaUnits::spawnLateEntry(int iMissionUnit, int gameTimeSecs)
 
 bool MultiplayerSchemaUnits::isAlive(int iMissionUnit)
 {
-	if (unsigned(iMissionUnit) >= m_spawnedUnits.size() || !m_spawnedUnits[iMissionUnit])
+	if (unsigned(iMissionUnit) >= m_spawnedUnits.size() || !m_spawnedUnits[iMissionUnit] || m_gone[iMissionUnit])
 	{
 		return false;
 	}
 	UnitStruct* unit = m_spawnedUnits[iMissionUnit];
-	return unit->IsUnit && unit->UnitID == m_spawnedType[iMissionUnit];
+	if (unit->IsUnit && unit->UnitID == m_spawnedType[iMissionUnit])
+	{
+		return true;
+	}
+	m_gone[iMissionUnit] = 1;	// dead for good: whatever takes its slot next is another unit
+	return false;
+}
+
+bool MultiplayerSchemaUnits::isDone(int iMissionUnit)
+{
+	if (unsigned(iMissionUnit) >= m_spawnedUnits.size())
+	{
+		return false;
+	}
+	return m_gone[iMissionUnit] || (m_spawnedUnits[iMissionUnit] && !isAlive(iMissionUnit));
+}
+
+// after=NAME: that entry's unit has spawned and died. after=PREFIX*: every entry whose name starts
+// with PREFIX has (a wave: after=W03*), and there is at least one. An entry still to come keeps the
+// gate shut; one whose unit couldn't be made counts as dead.
+bool MultiplayerSchemaUnits::afterGateOpen(const std::string& after)
+{
+	if (after.size() > 1 && after[after.size() - 1] == '*')
+	{
+		std::string prefix = after.substr(0, after.size() - 1);
+		bool any = false;
+		for (unsigned j = 0; j < m_rules.size(); ++j)
+		{
+			if (_strnicmp(m_rules[j].name.c_str(), prefix.c_str(), prefix.size()) != 0)
+			{
+				continue;
+			}
+			if (!isDone(int(j)))
+			{
+				return false;
+			}
+			any = true;
+		}
+		return any;
+	}
+	int other = findRule(after);
+	return other >= 0 && isDone(other);
+}
+
+// GG: a GGCLEAR: every wreck and heap on the map goes, on every machine, as if reclaimed. Wreck
+// types are each unit type's corpse (UnitDef +0x1BC) and what it turns into when destroyed
+// (FeatureDef +0xF4, the heap), as TA's corpse drop (0x486360) chooses them, so trees, rocks,
+// vents, metal patches and Dragon's Teeth stay. Queued here; clearQueuedWrecks takes a slice a pass.
+void MultiplayerSchemaUnits::queueWreckClear(int gameTimeSecs)
+{
+	TAdynmemStruct* ta = *(TAdynmemStruct**)0x00511de8;
+	if (m_wreckTypes.empty() && ta->NumFeatureDefs > 0)
+	{
+		m_wreckTypes.assign(ta->NumFeatureDefs, 0);
+		for (unsigned u = 0; u < ta->UNITINFOCount; ++u)
+		{
+			// The corpse and its heap only: whatever a heap leaves in turn may be a plain decal that
+			// maps use as decoration too.
+			unsigned feature = ta->UnitDef[u].corpse;
+			for (int step = 0; step < 2 && feature < m_wreckTypes.size(); ++step)
+			{
+				m_wreckTypes[feature] = 1;
+				feature = *(unsigned short*)ta->FeatureDef[feature].unknownField_F4;	// its heap
+			}
+		}
+	}
+	int queued = 0;
+	for (int z = 0; z < ta->FeatureMapSizeY; ++z)
+	{
+		for (int x = 0; x < ta->FeatureMapSizeX; ++x)
+		{
+			// A feature sits on its anchor cell; the rest of its footprint holds 0xfffe.
+			unsigned feature = ta->FeatureMap[z * ta->FeatureMapSizeX + x].FeatureDefIndex;
+			if (feature < m_wreckTypes.size() && m_wreckTypes[feature])
+			{
+				m_wreckQueue.push_back(std::make_pair(x, z));
+				++queued;
+			}
+		}
+	}
+	IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] wreck clear at %ds: %d wrecks", gameTimeSecs, queued);
+}
+
+// GG: up to 16 queued wrecks a director pass (32 a second), one 6-byte packet each as TA's own
+// reclaim sends, rather than a burst of hundreds in one tick. A cell is checked again first: a
+// player may have reclaimed it meanwhile.
+void MultiplayerSchemaUnits::clearQueuedWrecks()
+{
+	if (m_wreckQueue.empty())
+	{
+		return;
+	}
+	TAdynmemStruct* ta = *(TAdynmemStruct**)0x00511de8;
+	bool anyRemote = AnyRemotePlayer();
+	for (int n = 0; n < 16 && !m_wreckQueue.empty(); ++n)
+	{
+		std::pair<int, int> cell = m_wreckQueue.back();
+		m_wreckQueue.pop_back();
+		unsigned feature = ta->FeatureMap[cell.second * ta->FeatureMapSizeX + cell.first].FeatureDefIndex;
+		if (feature < m_wreckTypes.size() && m_wreckTypes[feature])
+		{
+			ReclaimFeatureEverywhere(cell.first, cell.second, anyRemote);
+		}
+	}
 }
 
 int MultiplayerSchemaUnits::findRule(const std::string& name)
@@ -955,7 +1127,7 @@ void MultiplayerSchemaUnits::runDirector(int gameTime)
 	int gameTimeSecs = gameTime / 30;
 	TAdynmemStruct* ta = *(TAdynmemStruct**)0x00511de8;
 
-	// Gated spawns whose condition has come true.
+	// Gated entries (units, messages, wreck clears) whose condition has come true.
 	for (auto it = m_pending.begin(); it != m_pending.end();)
 	{
 		int i = *it;
@@ -973,20 +1145,20 @@ void MultiplayerSchemaUnits::runDirector(int gameTime)
 		}
 		else
 		{
-			int other = findRule(rule.after);
-			open = other >= 0 && m_spawnedUnits[other] && !isAlive(other);
+			open = afterGateOpen(rule.after);
 		}
 		if (open)
 		{
 			IDDrawSurface::OutptFmtTxt("[MultiplayerSchemaUnits] %s's gate opened at %ds", rule.name.c_str(), gameTimeSecs);
 			it = m_pending.erase(it);
-			spawnLateEntry(i, gameTimeSecs);
+			fireEntry(i, gameTimeSecs);
 		}
 		else
 		{
 			++it;
 		}
 	}
+	clearQueuedWrecks();
 
 	// Hunters and escorts. The enemy's units are listed once a pass for each hunt list, not once a
 	// hunter: a wave of a hundred hunters would otherwise read every unit slot a hundred times.

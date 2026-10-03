@@ -236,6 +236,14 @@ extern _LoadCampaign_UniqueUnits LoadCampaign_UniqueUnits;
 typedef char(__stdcall* _Campaign_ParseUnitInitialMissionCommands)(UnitStruct* UnitPtr, const char* Source, void* outUniqueUnitID);
 extern _Campaign_ParseUnitInitialMissionCommands Campaign_ParseUnitInitialMissionCommands;
 
+// GG: what the 0x0F (feature action) packet handler calls for a reclaim, action 255 (0x4554b0).
+// Takes the feature over a map cell away: a sprite plays its reclamate sequence (reclaimed=1) or
+// die sequence (0); a 3DO feature, every wreck, is replaced by its reclaim remnant (FeatureDef
+// +0xF8, none for wrecks) or, as destroyed, its heap (+0xF4). Credits nobody and sends nothing:
+// TA's own reclaim (0x4237d0) credits the unit, calls this, then broadcasts 0F FF x z itself.
+typedef void(__stdcall* _FEATURES_Reclaimed)(int cellX, int cellZ, int reclaimed);
+extern _FEATURES_Reclaimed FEATURES_Reclaimed;
+
 typedef int(__fastcall* _SerialBitArrayRead)(SerialBitArrayStruct* serialBitArray, int ignored, int nBitsToRead);
 extern _SerialBitArrayRead SerialBitArrayRead;
 
