@@ -9,11 +9,14 @@
 
 namespace
 {
-	const char* const BUILD = "2025.12.13.2-apm";
+	const char* const BUILD = "2025.12.13.3-apm";
 
 	// Leaving the game screen this long (or a new game starting) ends the game. Shorter gaps are
 	// treated as the same game, in case an in-game menu leaves the game screen for a moment.
 	const DWORD GAME_END_GRACE_MS = 15000;
+
+	// Wheel notches in the same direction closer together than this are one scroll.
+	const DWORD SCROLL_GAP_MS = 250;
 
 	struct Parts
 	{
@@ -23,8 +26,9 @@ namespace
 		unsigned clicks = 0;     // mouse button presses
 		unsigned dblclicks = 0;  // the second press of a double-click, which Windows sends as ...BUTTONDBLCLK
 		unsigned wheel = 0;      // wheel notches, either direction
+		unsigned scrolls = 0;    // runs of notches in one direction, SCROLL_GAP_MS apart at most
 
-		bool Any() const { return keys || modifiers || repeats || clicks || dblclicks || wheel; }
+		bool Any() const { return keys || modifiers || repeats || clicks || dblclicks || wheel || scrolls; }
 
 		void Add(const Parts& o)
 		{
@@ -34,6 +38,7 @@ namespace
 			clicks += o.clicks;
 			dblclicks += o.dblclicks;
 			wheel += o.wheel;
+			scrolls += o.scrolls;
 		}
 	};
 
@@ -58,6 +63,8 @@ namespace
 
 	int repostedClicks = 0;
 	int wheelDelta = 0;
+	int lastWheelDirection = 0;
+	DWORD lastWheelMs = 0;
 
 	void OpenLog()
 	{
@@ -94,8 +101,8 @@ namespace
 
 	void FormatParts(char* out, size_t size, const Parts& p)
 	{
-		_snprintf_s(out, size, _TRUNCATE, "keys=%u mod=%u rep=%u clicks=%u dbl=%u wheel=%u",
-			p.keys, p.modifiers, p.repeats, p.clicks, p.dblclicks, p.wheel);
+		_snprintf_s(out, size, _TRUNCATE, "keys=%u mod=%u rep=%u clicks=%u dbl=%u wheel=%u scroll=%u",
+			p.keys, p.modifiers, p.repeats, p.clicks, p.dblclicks, p.wheel, p.scrolls);
 	}
 
 	bool SameMinute(const SYSTEMTIME& a, const SYSTEMTIME& b)
@@ -268,6 +275,15 @@ namespace ApmCounter
 		case 0x020E: // WM_MOUSEHWHEEL
 		{
 			int delta = (short)HIWORD(wParam);
+			int direction = (msg == 0x020E ? 2 : 1) * (delta < 0 ? -1 : 1);
+			DWORD nowMs = GetTickCount();
+			if (direction != lastWheelDirection || (DWORD)(nowMs - lastWheelMs) > SCROLL_GAP_MS)
+			{
+				p.scrolls = 1;
+				wheelDelta = 0;
+			}
+			lastWheelDirection = direction;
+			lastWheelMs = nowMs;
 			wheelDelta += delta < 0 ? -delta : delta;
 			p.wheel = wheelDelta / 120;
 			wheelDelta %= 120;
